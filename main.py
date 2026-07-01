@@ -139,7 +139,7 @@ def call_groq(messages: List[Message]) -> dict:
     api_messages = [{"role": m.role, "content": m.content} for m in messages]
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         messages=[{"role": "system", "content": SYSTEM_PROMPT}] + api_messages,
         max_tokens=1500,
         temperature=0.2,
