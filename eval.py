@@ -49,7 +49,7 @@ def post_chat(messages, timeout=90):
         return json.loads(resp.read().decode())
 
 
-def get_health(timeout=60):
+def get_health(timeout=150):
     req = urllib.request.Request(f"{BASE_URL}/health", method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
@@ -88,18 +88,23 @@ check("No duplicate URLs", len(urls) == len(set(urls)))
 # ── 1. Warm-up / health check ────────────────────────────────────────────────
 print("\n[1] API reachability")
 api_up = False
-try:
-    t0 = time.time()
-    h = get_health()
-    dt = time.time() - t0
-    check("GET /health returns ok", h.get("status") == "ok", str(h))
-    print(f"    time cold-start/response time: {dt:.1f}s")
-    api_up = True
-except Exception as e:
-    check("GET /health reachable", False, str(e))
-    print("\nWARNING: API unreachable - skipping live trace replay.")
-    print("   Set API_BASE_URL env var to your deployed URL, or run")
-    print("   `uvicorn main:app --reload` locally, then re-run eval.py.")
+for attempt in range(2):
+    try:
+        t0 = time.time()
+        h = get_health()
+        dt = time.time() - t0
+        check("GET /health returns ok", h.get("status") == "ok", str(h))
+        print(f"    time cold-start/response time: {dt:.1f}s")
+        api_up = True
+        break
+    except Exception as e:
+        if attempt == 0:
+            print(f"    (first attempt timed out - Render free tier may be cold-starting, retrying once...)")
+            continue
+        check("GET /health reachable", False, str(e))
+        print("\nWARNING: API unreachable - skipping live trace replay.")
+        print("   Set API_BASE_URL env var to your deployed URL, or run")
+        print("   `uvicorn main:app --reload` locally, then re-run eval.py.")
 
 # ── 2. Replay real traces (only if API is up) ────────────────────────────────
 retrieval_hits, retrieval_total = 0, 0     # recall: expected items actually returned
