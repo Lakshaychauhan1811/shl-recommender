@@ -113,6 +113,7 @@ if api_up:
         history = []
         for i, turn in enumerate(turns, 1):
             history.append({"role": "user", "content": turn["user"]})
+            time.sleep(2.5)  # stay under Groq free-tier 30 RPM cap across the full replay
             try:
                 resp = post_chat(history)
             except Exception as e:

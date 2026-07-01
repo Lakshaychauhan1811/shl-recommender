@@ -1,13 +1,13 @@
 import os
-import json
 import re
+import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 from groq import Groq
 
-app = FastAPI(title="SHL Assessment Recommender", version="2.0.0")
+app = FastAPI(title="SHL Assessment Recommender", version="2.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Load catalog ─────────────────────────────────────────────────────────────
@@ -29,35 +29,110 @@ KEY_MAP = {
     "Assessment Exercises": "E",
 }
 
+def format_row(item: dict) -> str:
+    codes = ",".join(KEY_MAP.get(k, k[0]) for k in item["keys"])
+    levels = "|".join(item.get("job_levels", []))
+    langs = "|".join(item.get("languages", [])[:5])
+    dur = item.get("duration") or "-"
+    desc = (item.get("description") or "")[:120].replace("\n", " ")
+    return f'{item["name"]} || {codes} || {levels} || {dur} || {langs} || {item["link"]} || {desc}'
+
 def build_catalog_text(catalog: list[dict]) -> str:
     lines = ["NAME || TYPE_CODES || JOB_LEVELS || DURATION || LANGUAGES || URL || DESCRIPTION"]
-    for item in catalog:
-        codes = ",".join(KEY_MAP.get(k, k[0]) for k in item["keys"])
-        levels = "|".join(item.get("job_levels", []))
-        langs  = "|".join(item.get("languages", [])[:5])
-        dur    = item.get("duration") or "-"
-        desc   = (item.get("description") or "")[:120].replace("\n", " ")
-        lines.append(
-            f'{item["name"]} || {codes} || {levels} || {dur} || {langs} || {item["link"]} || {desc}'
-        )
+    lines += [format_row(item) for item in catalog]
     return "\n".join(lines)
 
-CATALOG_TEXT = build_catalog_text(CATALOG)
-
-# Build lookup maps for validation
+# Build lookup maps for validation (always against the FULL catalog, never the filtered subset)
 _CATALOG_BY_NAME = {item["name"].lower(): item for item in CATALOG}
-_CATALOG_BY_URL  = {item["link"]: item for item in CATALOG}
+_CATALOG_BY_URL = {item["link"].rstrip("/") + "/": item for item in CATALOG}
 
-# ── System prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = f"""You are an expert SHL Assessment Recommender. Your ONLY job is to help hiring managers and recruiters find the right SHL Individual Test Solutions through natural conversation.
+# ── Lightweight keyword-based retrieval ──────────────────────────────────────
+# The full catalog is ~31,700 tokens, which alone exceeds Groq's free-tier
+# per-minute token budget (6,000-8,000 TPM depending on model). Instead of
+# sending all 377 products on every call, we retrieve only the subset that's
+# plausibly relevant to the conversation so far, then let the LLM pick from
+# that shortlist. Hallucination/groundedness checks still run against the
+# FULL catalog (see validate_recommendations), so this only limits what the
+# model *sees*, never what a response is *validated* against.
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "for", "to", "of", "in", "on", "is",
+    "are", "we", "our", "us", "i", "you", "your", "need", "want", "with",
+    "what", "should", "that", "this", "it", "be", "as", "at", "by", "from",
+    "have", "has", "do", "does", "can", "will", "would", "please", "help",
+    "assessment", "assessments", "test", "tests", "solution", "solutions",
+}
 
-## THE COMPLETE SHL CATALOG
-Every product you can ever recommend is listed below. NEVER recommend anything outside this list.
+def _tokenize(text: str) -> set:
+    words = re.findall(r"[a-zA-Z0-9\+\.#]+", text.lower())
+    tokens = set()
+    for w in words:
+        if len(w) > 2 and w not in _STOPWORDS:
+            tokens.add(w)
+        stripped = w.strip(".")
+        if len(stripped) > 2 and stripped not in _STOPWORDS:
+            tokens.add(stripped)
+    return tokens
+
+# Precompute a search blob per catalog item once at startup
+_SEARCH_BLOBS = []
+for _item in CATALOG:
+    blob = " ".join([
+        _item["name"],
+        _item.get("description") or "",
+        " ".join(_item.get("job_levels", [])),
+        " ".join(_item.get("keys", [])),
+    ]).lower()
+    _SEARCH_BLOBS.append(_tokenize(blob))
+
+# A small always-included core so common defaults (e.g. OPQ32r) survive even
+# on vague first turns before enough keywords have accumulated.
+_CORE_DEFAULT_NAMES = {
+    "occupational personality questionnaire opq32r",
+    "shl verify interactive g+",
+}
+
+def select_relevant_catalog(conversation_text: str, top_n: int = 45) -> list[dict]:
+    query_tokens = _tokenize(conversation_text)
+
+    scored = []
+    for idx, item in enumerate(CATALOG):
+        overlap = len(query_tokens & _SEARCH_BLOBS[idx])
+        if item["name"].lower() in _CORE_DEFAULT_NAMES:
+            overlap += 1  # small nudge so core defaults surface even with weak signal
+        scored.append((overlap, idx))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_idxs = [idx for score, idx in scored[:top_n] if score > 0]
+
+    # Fallback: if the query is too vague to score anything (e.g. "I need an
+    # assessment"), still send a small generic cross-section so the model has
+    # enough to ask a good clarifying question against.
+    if len(top_idxs) < 10:
+        seen = set(top_idxs)
+        for idx, item in enumerate(CATALOG):
+            if item["name"].lower() in _CORE_DEFAULT_NAMES and idx not in seen:
+                top_idxs.append(idx)
+                seen.add(idx)
+        # pad with a spread across common categories
+        for idx in range(0, len(CATALOG), max(1, len(CATALOG) // 40)):
+            if idx not in seen:
+                top_idxs.append(idx)
+                seen.add(idx)
+            if len(top_idxs) >= 40:
+                break
+
+    return [CATALOG[i] for i in top_idxs]
+
+# ── System prompt (catalog section is injected per-request) ─────────────────
+SYSTEM_PROMPT_TEMPLATE = """You are an expert SHL Assessment Recommender. Your ONLY job is to help hiring managers and recruiters find the right SHL Individual Test Solutions through natural conversation.
+
+## RELEVANT SHL CATALOG (filtered to this conversation)
+The products below are the ones most relevant to this conversation, retrieved from SHL's full 377-product catalog based on the terms discussed so far. NEVER recommend anything outside this list. If nothing here truly fits, say so honestly rather than forcing a match — do not invent a product.
 Column format: NAME || TYPE_CODES || JOB_LEVELS || DURATION || LANGUAGES || URL || DESCRIPTION
 
 Type codes: A=Ability/Aptitude, K=Knowledge/Skills, P=Personality/Behavior, B=Biodata/SJT, S=Simulations, C=Competencies, D=Development/360, E=Assessment Exercises
 
-{CATALOG_TEXT}
+{catalog_text}
 
 ## BEHAVIORAL RULES
 
@@ -117,12 +192,13 @@ def enforce_turn_cap(messages: List[Message], cap: int = 8) -> List[Message]:
     return messages[-cap:] if len(messages) > cap else messages
 
 def validate_recommendations(recs: list) -> List[Recommendation]:
-    """Strip any hallucinated items; normalise to exact catalog values."""
+    """Strip any hallucinated items; normalise to exact catalog values.
+    Always checked against the FULL catalog, regardless of what subset the
+    model was shown, so groundedness is never weakened by retrieval."""
     valid = []
     for r in recs[:10]:
         name = (r.get("name") or "").strip()
-        url  = (r.get("url") or "").strip()
-        # Match by name first, then URL
+        url = (r.get("url") or "").strip().rstrip("/") + "/"
         entry = _CATALOG_BY_NAME.get(name.lower()) or _CATALOG_BY_URL.get(url)
         if entry:
             codes = ",".join(KEY_MAP.get(k, k[0]) for k in entry["keys"])
@@ -136,18 +212,22 @@ def validate_recommendations(recs: list) -> List[Recommendation]:
 def call_groq(messages: List[Message]) -> dict:
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
+    conversation_text = " ".join(m.content for m in messages)
+    relevant_catalog = select_relevant_catalog(conversation_text, top_n=38)
+    catalog_text = build_catalog_text(relevant_catalog)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(catalog_text=catalog_text)
+
     api_messages = [{"role": m.role, "content": m.content} for m in messages]
 
     response = client.chat.completions.create(
         model="openai/gpt-oss-120b",
-        messages=[{"role": "system", "content": SYSTEM_PROMPT}] + api_messages,
-        max_tokens=1500,
+        messages=[{"role": "system", "content": system_prompt}] + api_messages,
+        max_tokens=700,
         temperature=0.2,
         response_format={"type": "json_object"},
     )
 
     raw = response.choices[0].message.content.strip()
-    # Strip markdown fences if any
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw).strip()
 
@@ -176,11 +256,10 @@ def chat(request: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM error: {e}")
 
-    reply    = parsed.get("reply", "Sorry, I couldn't process that.")
+    reply = parsed.get("reply", "Sorry, I couldn't process that.")
     raw_recs = parsed.get("recommendations") or []
     end_conv = bool(parsed.get("end_of_conversation", False))
 
-    # Ensure recommendations is always a list (traces sometimes use null)
     if not isinstance(raw_recs, list):
         raw_recs = []
 
